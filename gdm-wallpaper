@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# gdm-wallpaper — change the Ubuntu GDM login screen wallpaper with one command.
+# https://github.com/Kumarsujay03/ubuntu-gdm-wallpaper  (MIT License)
+#
+# Usage:
+#   gdm-wallpaper set <image> [--no-glass]   Set a new login wallpaper
+#   gdm-wallpaper undo                        Go back to the previous login screen
+#   gdm-wallpaper reset                       Restore the original Ubuntu login screen
+#   gdm-wallpaper status                      Show current state and backups
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# GDM's theme is selected through the alternatives system; follow it to the real file.
+RESOURCE="$(readlink -f /usr/share/gnome-shell/gdm-theme.gresource 2>/dev/null || true)"
+[[ -f "$RESOURCE" ]] || RESOURCE="/usr/share/gnome-shell/theme/Yaru/gnome-shell-theme.gresource"
+
+ORIGINAL="$RESOURCE.gdm-wallpaper-original"   # pristine copy, taken once, never overwritten
+PREVIOUS="$RESOURCE.gdm-wallpaper-previous"   # state before the last change (for undo)
+WALLPAPER="/usr/share/backgrounds/gdm-wallpaper.jpg"
+PREFIX="/org/gnome/shell/theme"
+BEGIN_MARK="/* >>> gdm-wallpaper >>> */"
+END_MARK="/* <<< gdm-wallpaper <<< */"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+usage() {
+    sed -n '5,9p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+need() {
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required. Install it with: sudo apt install ${PKG[$cmd]:-$cmd}"
+    done
+}
+declare -A PKG=([gresource]=libglib2.0-bin [glib-compile-resources]=libglib2.0-dev-bin [magick]=imagemagick)
+
+confirm() {
+    read -r -p "$1 [y/N] " answer
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+ensure_original_backup() {
+    if ! sudo test -f "$ORIGINAL"; then
+        info "First run: saving original theme to $ORIGINAL"
+        sudo cp -a "$RESOURCE" "$ORIGINAL"
+    fi
+}
+
+glass_css() {
+    cat <<'CSS'
+/* Glass-style user list, password field and buttons */
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:selected,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:focus,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:hover {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    box-shadow: none !important;
+    border: none !important;
+}
+.login-dialog StEntry,
+.login-dialog StEntry:focus,
+.login-dialog .login-dialog-prompt-entry,
+.login-dialog .login-dialog-prompt-entry:focus {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    border: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    border-radius: 12px !important;
+}
+.login-dialog-not-listed-button,
+.login-dialog-not-listed-button:hover,
+.login-dialog-not-listed-button:focus,
+.login-dialog-not-listed-button:active {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    color: #f2f2f2 !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+.login-dialog .cancel-button,
+.login-dialog .cancel-button:hover,
+.login-dialog .cancel-button:focus,
+.login-dialog .cancel-button:active,
+.login-dialog .cancel-button:checked {
+    background-color: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+}
+.login-dialog .cancel-button StIcon {
+    color: #f2f2f2 !important;
+}
+CSS
+}
+
+cmd_set() {
+    local input="" glass=1
+    for arg in "$@"; do
+        case "$arg" in
+            --no-glass) glass=0 ;;
+            -*) die "Unknown option: $arg" ;;
+            *) [[ -z "$input" ]] || die "Only one image may be given."; input="$arg" ;;
+        esac
+    done
+    [[ -n "$input" ]] || { usage; exit 1; }
+    [[ -f "$input" ]] || die "Image not found: $input"
+    need gresource glib-compile-resources
+
+    local ext="${input##*.}"; ext="${ext,,}"
+    case "$ext" in
+        jpg|jpeg) ;;
+        png|webp|avif|heic) need magick ;;
+        *) die "Unsupported image format '.$ext'. Use JPG, PNG, WEBP, AVIF or HEIC." ;;
+    esac
+
+    sudo -v
+    ensure_original_backup
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    info "Preparing wallpaper"
+    if [[ "$ext" == jpg || "$ext" == jpeg ]]; then
+        cp "$input" "$tmp/wallpaper.jpg"
+    else
+        magick "$input" -auto-orient -strip -quality 92 "JPEG:$tmp/wallpaper.jpg"
+    fi
+
+    info "Extracting current GDM theme"
+    local src="$tmp/src" xml="$tmp/theme.gresource.xml" path rel
+    mkdir -p "$src"
+    {
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+        echo "<gresources><gresource prefix=\"$PREFIX\">"
+        while read -r path; do
+            rel="${path#"$PREFIX"/}"
+            mkdir -p "$src/$(dirname "$rel")"
+            gresource extract "$RESOURCE" "$path" > "$src/$rel"
+            echo "<file>$rel</file>"
+        done < <(gresource list "$RESOURCE")
+        echo "</gresource></gresources>"
+    } > "$xml"
+    [[ -f "$src/gdm.css" ]] || die "This theme has no gdm.css; unsupported layout."
+
+    info "Patching gdm.css"
+    # Remove any block from a previous run, then append a fresh one (last rule wins).
+    sed -i "\|^/\* >>> gdm-wallpaper >>> \*/\$|,\|^/\* <<< gdm-wallpaper <<< \*/\$|d" "$src/gdm.css"
+    {
+        echo
+        echo "$BEGIN_MARK"
+        cat <<CSS
+#lockDialogGroup {
+    background-color: #222222;
+    background-image: url("file://$WALLPAPER");
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+CSS
+        (( glass )) && glass_css
+        echo "$END_MARK"
+    } >> "$src/gdm.css"
+
+    info "Compiling new theme"
+    glib-compile-resources "$xml" --sourcedir="$src" --target="$tmp/new.gresource"
+    [[ -s "$tmp/new.gresource" ]] || die "Compiled theme is empty; nothing was changed."
+
+    info "Installing (previous state saved for 'undo')"
+    sudo cp -a "$RESOURCE" "$PREVIOUS"
+    if [[ -f "$WALLPAPER" ]]; then sudo cp -a "$WALLPAPER" "$WALLPAPER.previous"; fi
+    sudo install -m 644 "$tmp/wallpaper.jpg" "$WALLPAPER"
+    sudo install -m 644 "$tmp/new.gresource" "$RESOURCE"
+
+    echo
+    echo "Done! Log out or reboot to see your new login screen."
+    echo "Changed your mind? Run: gdm-wallpaper undo"
+}
+
+cmd_undo() {
+    sudo test -f "$PREVIOUS" || die "Nothing to undo."
+    confirm "Restore the login screen from before the last change?" || { echo "Cancelled."; exit 0; }
+    sudo install -m 644 "$PREVIOUS" "$RESOURCE"
+    if sudo test -f "$WALLPAPER.previous"; then sudo install -m 644 "$WALLPAPER.previous" "$WALLPAPER"; fi
+    echo "Previous login screen restored. Log out or reboot to apply."
+}
+
+cmd_reset() {
+    if sudo test -f "$ORIGINAL"; then
+        confirm "Restore the original login screen (from before gdm-wallpaper was first used)?" || { echo "Cancelled."; exit 0; }
+        sudo install -m 644 "$ORIGINAL" "$RESOURCE"
+    else
+        confirm "No backup found. Reinstall the stock theme package instead?" || { echo "Cancelled."; exit 0; }
+        sudo apt-get install --reinstall -y "$(dpkg -S "$RESOURCE" | cut -d: -f1)"
+    fi
+    echo "Original login screen restored. Log out or reboot to apply."
+}
+
+cmd_status() {
+    echo "gdm-wallpaper $VERSION"
+    echo "GDM theme:  $RESOURCE"
+    if gresource extract "$RESOURCE" "$PREFIX/gdm.css" 2>/dev/null | grep -qF "$BEGIN_MARK"; then
+        echo "Custom:     yes ($WALLPAPER)"
+    else
+        echo "Custom:     no (stock login screen)"
+    fi
+    sudo test -f "$ORIGINAL" && echo "Original:   $ORIGINAL" || echo "Original:   (not yet saved)"
+    sudo test -f "$PREVIOUS" && echo "Undo:       available" || echo "Undo:       not available"
+}
+
+case "${1:-}" in
+    set)     shift; cmd_set "$@" ;;
+    undo)    cmd_undo ;;
+    reset)   cmd_reset ;;
+    status)  cmd_status ;;
+    -v|--version) echo "gdm-wallpaper $VERSION" ;;
+    -h|--help|help|"") usage ;;
+    *)
+        # Shortcut: `gdm-wallpaper image.jpg` == `gdm-wallpaper set image.jpg`
+        if [[ -f "$1" ]]; then cmd_set "$@"; else usage; exit 1; fi ;;
+esac
