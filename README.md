@@ -43,6 +43,13 @@ gdm-wallpaper status                            # show current state
 
 Log out or reboot to see the change.
 
+## Want more glass?
+
+For finer control over the glass look (opacity, corner radius, transparent back
+button, 12-hour clock), use the companion tool
+[**gdm-glass**](https://github.com/Kumarsujay03/ubuntu-gdm-glass). When gdm-glass
+is active, gdm-wallpaper leaves the glass styling to it.
+
 ## How it works
 
 GDM's look comes from a compiled theme file

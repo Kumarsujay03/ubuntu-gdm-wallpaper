@@ -9,7 +9,7 @@
 #   gdm-wallpaper status                      Show current state and backups
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # GDM's theme is selected through the alternatives system; follow it to the real file.
 RESOURCE="$(readlink -f /usr/share/gnome-shell/gdm-theme.gresource 2>/dev/null || true)"
@@ -148,6 +148,8 @@ cmd_set() {
     info "Patching gdm.css"
     # Remove any block from a previous run, then append a fresh one (last rule wins).
     sed -i "\|^/\* >>> gdm-wallpaper >>> \*/\$|,\|^/\* <<< gdm-wallpaper <<< \*/\$|d" "$src/gdm.css"
+    # gdm-glass manages its own glass styling; don't override its settings.
+    if grep -qF "/* >>> gdm-glass >>> */" "$src/gdm.css"; then glass=0; fi
     {
         echo
         echo "$BEGIN_MARK"
