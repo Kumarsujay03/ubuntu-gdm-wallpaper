@@ -1,5 +1,7 @@
 # ubuntu-gdm-wallpaper
 
+<p align="center"><img src="docs/banner.png" alt="gdm-wallpaper banner" width="100%"></p>
+
 Change the **Ubuntu login screen (GDM) wallpaper** with one command — with a
 modern glass-style login box, and automatic backups so you can always go back.
 
